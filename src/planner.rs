@@ -1,8 +1,27 @@
 use std::path::Path;
+use std::sync::LazyLock;
 use serde::Serialize;
 use regex::Regex;
 
 use crate::LoomError;
+
+const ACTION_WORDS: [&str; 13] = [
+    "add", "create", "new", "fix", "bug", "repair", "refactor", "update", "modify", "delete",
+    "remove", "test", "deploy",
+];
+
+static ACTION_WORD_REGEXES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    ACTION_WORDS
+        .iter()
+        .map(|word| {
+            let pattern = format!(r"\b{}\b", regex::escape(word));
+            (
+                *word,
+                Regex::new(&pattern).expect("action word regex is valid"),
+            )
+        })
+        .collect()
+});
 
 /// A work plan derived from a brief.
 #[derive(Debug, Serialize, serde::Deserialize)]
@@ -229,13 +248,11 @@ fn detect_project_type(repo: &Path) -> String {
     else { "unknown".to_string() }
 }
 
-fn extract_keywords(brief: &str) -> Vec<&str> {
-    let action_words = ["add", "create", "new", "fix", "bug", "repair",
-        "refactor", "update", "modify", "delete", "remove", "test", "deploy"];
+fn extract_keywords(brief: &str) -> Vec<&'static str> {
     let lower = brief.to_lowercase();
-    action_words.iter()
-        .filter(|w| lower.contains(**w))
-        .copied()
+    ACTION_WORD_REGEXES
+        .iter()
+        .filter_map(|(word, re)| re.is_match(&lower).then_some(*word))
         .collect()
 }
 
@@ -378,6 +395,13 @@ mod tests {
         assert!(keywords.contains(&"add"));
         assert!(keywords.contains(&"fix"));
         assert!(keywords.contains(&"new"));
+    }
+
+    #[test]
+    fn extract_keywords_requires_word_boundaries() {
+        let keywords = extract_keywords("Update prefix routing in the fixture");
+        assert!(keywords.contains(&"update"));
+        assert!(!keywords.contains(&"fix"));
     }
 }
 
