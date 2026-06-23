@@ -127,11 +127,15 @@ pub fn plan_from_brief(
     }
     validation.push("rivet check".to_string());
 
-    // Assign agents if provided
-    let agent_assignments = if agents.is_empty() {
+    // Assign agents if provided (filter empty names)
+    let valid_agents: Vec<String> = agents.iter()
+        .filter(|a| !a.trim().is_empty())
+        .cloned()
+        .collect();
+    let agent_assignments = if valid_agents.is_empty() {
         vec![]
     } else {
-        assign_agents(agents, &steps)
+        assign_agents(&valid_agents, &steps)
     };
 
     Ok(WorkPlan {
@@ -273,6 +277,9 @@ fn test_command(project_type: &str) -> Option<String> {
 }
 
 fn assign_agents(agents: &[String], steps: &[WorkStep]) -> Vec<AgentAssignment> {
+    if agents.is_empty() {
+        return vec![];
+    }
     // Simple round-robin assignment
     agents.iter().enumerate().map(|(i, agent)| {
         let my_steps: Vec<usize> = steps.iter()
