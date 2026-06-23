@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::LazyLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use regex::Regex;
 
 use crate::LoomError;
@@ -9,6 +9,7 @@ const ACTION_WORDS: [&str; 13] = [
     "add", "create", "new", "fix", "bug", "repair", "refactor", "update", "modify", "delete",
     "remove", "test", "deploy",
 ];
+const SENTINEL_HIGH_RISK_LIMIT: usize = 5;
 
 static ACTION_WORD_REGEXES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     ACTION_WORDS
@@ -22,6 +23,18 @@ static ACTION_WORD_REGEXES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new
         })
         .collect()
 });
+
+#[derive(Debug, Deserialize)]
+struct SentinelMatrix {
+    files: Vec<SentinelFileRisk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SentinelFileRisk {
+    path: String,
+    risk_score: u32,
+    level: String,
+}
 
 /// A work plan derived from a brief.
 #[derive(Debug, Serialize, serde::Deserialize)]
@@ -190,6 +203,16 @@ pub fn suggest_next(repo: &Path) -> Result<Vec<String>, LoomError> {
         suggestions.push(format!("Run `{cmd}` to validate current state."));
     }
 
+    // Check for sentinel high-risk files
+    if let Some(summary) = sentinel_high_risk_summary(repo) {
+        suggestions.push(summary);
+    }
+
+    // Check for protected agent contracts
+    if repo.join(".agent-contract.toml").exists() {
+        suggestions.push("Agent contract found. Run `keystone lint` before committing.".to_string());
+    }
+
     // Check for outdated deps
     if repo.join("Cargo.toml").exists() || repo.join("package.json").exists() {
         suggestions.push("Run `quarry audit` to check dependency health.".to_string());
@@ -254,6 +277,44 @@ fn extract_keywords(brief: &str) -> Vec<&'static str> {
         .iter()
         .filter_map(|(word, re)| re.is_match(&lower).then_some(*word))
         .collect()
+}
+
+fn sentinel_high_risk_summary(repo: &Path) -> Option<String> {
+    let path = repo.join(".agent-sentinel").join("matrix.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let matrix: SentinelMatrix = serde_json::from_str(&content).ok()?;
+
+    let mut high_risk: Vec<SentinelFileRisk> = matrix.files
+        .into_iter()
+        .filter(|file| file.level == "high")
+        .collect();
+    if high_risk.is_empty() {
+        return None;
+    }
+
+    high_risk.sort_by(|a, b| {
+        b.risk_score
+            .cmp(&a.risk_score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let shown = high_risk
+        .iter()
+        .take(SENTINEL_HIGH_RISK_LIMIT)
+        .map(|file| format!("{} ({})", file.path, file.risk_score))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hidden_count = high_risk.len().saturating_sub(SENTINEL_HIGH_RISK_LIMIT);
+    let suffix = if hidden_count > 0 {
+        format!("; {hidden_count} more")
+    } else {
+        String::new()
+    };
+
+    Some(format!(
+        "Sentinel flags {} high-risk file(s): {shown}{suffix}. Prioritize targeted tests before commit.",
+        high_risk.len()
+    ))
 }
 
 fn guess_files_from_brief(brief: &str, project_type: &str) -> Vec<String> {
@@ -370,6 +431,39 @@ mod tests {
         init_repo(tmp.path());
         let suggestions = suggest_next(tmp.path()).unwrap();
         assert!(!suggestions.is_empty());
+    }
+
+    #[test]
+    fn suggest_next_highlights_sentinel_high_risk_files() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".agent-sentinel")).unwrap();
+        std::fs::write(
+            tmp.path().join(".agent-sentinel/matrix.json"),
+            r#"{
+                "files": [
+                    { "path": "src/lib.rs", "risk_score": 88, "level": "high" },
+                    { "path": "src/quiet.rs", "risk_score": 12, "level": "low" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let suggestions = suggest_next(tmp.path()).unwrap();
+        let joined = suggestions.join("\n");
+        assert!(joined.contains("Sentinel flags 1 high-risk file(s)"));
+        assert!(joined.contains("src/lib.rs (88)"));
+        assert!(!joined.contains("src/quiet.rs"));
+    }
+
+    #[test]
+    fn suggest_next_recommends_keystone_lint_when_contract_exists() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join(".agent-contract.toml"), "").unwrap();
+
+        let suggestions = suggest_next(tmp.path()).unwrap();
+        assert!(suggestions.iter().any(|s| s.contains("keystone lint")));
     }
 
     #[test]
