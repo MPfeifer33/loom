@@ -293,10 +293,97 @@ fn assign_agents(agents: &[String], steps: &[WorkStep]) -> Vec<AgentAssignment> 
     }).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn init_repo(dir: &std::path::Path) {
+        std::process::Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        std::process::Command::new("git").args(["add", "."]).current_dir(dir).output().unwrap();
+        std::process::Command::new("git").args(["commit", "-m", "init"]).current_dir(dir).output().unwrap();
+    }
+
+    #[test]
+    fn plan_creates_steps_from_add_keyword() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let plan = plan_from_brief(tmp.path(), "Add new user authentication", &[]).unwrap();
+        assert!(!plan.steps.is_empty());
+        assert!(plan.steps.iter().any(|s| matches!(s.kind, StepKind::Create)));
+    }
+
+    #[test]
+    fn plan_creates_steps_from_fix_keyword() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let plan = plan_from_brief(tmp.path(), "Fix the login bug", &[]).unwrap();
+        assert!(plan.steps.iter().any(|s| matches!(s.kind, StepKind::Modify)));
+    }
+
+    #[test]
+    fn plan_always_includes_review_step() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let plan = plan_from_brief(tmp.path(), "Add tests", &[]).unwrap();
+        assert!(plan.steps.iter().any(|s| matches!(s.kind, StepKind::Review)));
+    }
+
+    #[test]
+    fn agent_assignment_round_robin() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let plan = plan_from_brief(tmp.path(), "Add new feature", &["nix".into(), "bjarn".into()]).unwrap();
+        assert_eq!(plan.agent_assignments.len(), 2);
+        assert_eq!(plan.agent_assignments[0].agent, "nix");
+        assert_eq!(plan.agent_assignments[1].agent, "bjarn");
+    }
+
+    #[test]
+    fn suggest_next_in_clean_repo() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let suggestions = suggest_next(tmp.path()).unwrap();
+        assert!(!suggestions.is_empty());
+    }
+
+    #[test]
+    fn emit_latch_commands_from_plan() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let plan = plan_from_brief(tmp.path(), "Add feature", &["nix".into()]).unwrap();
+        let commands = emit_latch_commands(&plan);
+        assert!(commands[0].starts_with("latch init"));
+    }
+
+    #[test]
+    fn summarize_handles_utf8() {
+        // Should not panic on multi-byte characters
+        let s = "Hello 世界 this is a test brief with unicode";
+        let result = summarize(s, 10);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn extract_keywords_case_insensitive() {
+        let keywords = extract_keywords("ADD a new Feature and FIX bugs");
+        assert!(keywords.contains(&"add"));
+        assert!(keywords.contains(&"fix"));
+        assert!(keywords.contains(&"new"));
+    }
+}
+
 fn summarize(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Find a char boundary at or before max to avoid panicking on multi-byte UTF-8
+        let end = s.char_indices()
+            .take_while(|(i, _)| *i < max)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}...", &s[..end])
     }
 }
